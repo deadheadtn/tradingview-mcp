@@ -9,6 +9,7 @@ import os
 import math
 import logging
 import json
+import itertools
 from datetime import datetime, timedelta
 from typing import Optional, List
 
@@ -2546,6 +2547,433 @@ def list_exchanges() -> str:
         lines.append(", ".join(exch_list))
         lines.append("")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Backtesting engine — private helpers
+# ---------------------------------------------------------------------------
+
+def _bt_annualization(freq: str) -> float:
+    freq = freq.upper()
+    if freq in ("1D", "D"):   return math.sqrt(252)
+    if freq in ("1W", "W"):   return math.sqrt(52)
+    if freq in ("1M", "M"):   return math.sqrt(12)
+    if freq == "240":          return math.sqrt(252 * 6.5 / 4)
+    if freq == "60":           return math.sqrt(252 * 6.5)
+    if freq == "30":           return math.sqrt(252 * 6.5 * 2)
+    if freq == "15":           return math.sqrt(252 * 6.5 * 4)
+    if freq == "5":            return math.sqrt(252 * 6.5 * 12)
+    return math.sqrt(252)
+
+
+def _bt_rsi(close, period=14):
+    import pandas as _pd, numpy as _np
+    delta = _np.diff(close, prepend=close[0])
+    gain  = _np.where(delta > 0, delta, 0.0)
+    loss  = _np.where(delta < 0, -delta, 0.0)
+    avg_g = _pd.Series(gain).ewm(alpha=1.0/period, adjust=False).mean().values
+    avg_l = _pd.Series(loss).ewm(alpha=1.0/period, adjust=False).mean().values
+    rs    = _np.where(avg_l == 0, _np.inf, avg_g / avg_l)
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _bt_macd(close, fast=12, slow=26, signal=9):
+    import pandas as _pd
+    s = _pd.Series(close)
+    macd = (s.ewm(span=fast, adjust=False).mean()
+           - s.ewm(span=slow, adjust=False).mean()).values
+    sig  = _pd.Series(macd).ewm(span=signal, adjust=False).mean().values
+    return macd, sig
+
+
+def _bt_bb(close, period=20, std_dev=2.0):
+    import pandas as _pd
+    s   = _pd.Series(close)
+    mid = s.rolling(period).mean()
+    std = s.rolling(period).std()
+    return (mid + std_dev*std).values, mid.values, (mid - std_dev*std).values
+
+
+def _bt_sma(close, period):
+    import pandas as _pd
+    return _pd.Series(close).rolling(period).mean().values
+
+
+def _bt_ema(close, period):
+    import pandas as _pd
+    return _pd.Series(close).ewm(span=period, adjust=False).mean().values
+
+
+def _generate_signals(df, indicator: str, params: dict):
+    import numpy as _np
+    close = df["close"].values.astype(float)
+    n = len(close)
+    sig = _np.zeros(n, dtype=int)
+    ind = indicator.lower().replace("-", "_")
+
+    if ind == "rsi":
+        period     = int(params.get("period", 14))
+        oversold   = float(params.get("oversold", 30))
+        overbought = float(params.get("overbought", 70))
+        rsi = _bt_rsi(close, period)
+        for i in range(1, n):
+            if rsi[i-1] <= oversold  and rsi[i] > oversold:   sig[i] =  1
+            if rsi[i-1] >= overbought and rsi[i] < overbought: sig[i] = -1
+
+    elif ind == "macd":
+        fast   = int(params.get("fast", 12))
+        slow   = int(params.get("slow", 26))
+        signal = int(params.get("signal", 9))
+        macd, sig_line = _bt_macd(close, fast, slow, signal)
+        for i in range(1, n):
+            if macd[i-1] <= sig_line[i-1] and macd[i] > sig_line[i]: sig[i] =  1
+            if macd[i-1] >= sig_line[i-1] and macd[i] < sig_line[i]: sig[i] = -1
+
+    elif ind in ("bb", "bollinger", "bollinger_bands"):
+        period  = int(params.get("period", 20))
+        std_dev = float(params.get("std_dev", 2.0))
+        upper, mid, lower = _bt_bb(close, period, std_dev)
+        for i in range(1, n):
+            if _np.isnan(lower[i]) or _np.isnan(upper[i]): continue
+            if close[i-1] >= lower[i-1] and close[i] < lower[i]: sig[i] =  1
+            if close[i-1] <= upper[i-1] and close[i] > upper[i]: sig[i] = -1
+
+    elif ind in ("ma_cross", "sma_cross"):
+        fast_p = int(params.get("fast", 20))
+        slow_p = int(params.get("slow", 50))
+        fma = _bt_sma(close, fast_p)
+        sma = _bt_sma(close, slow_p)
+        for i in range(1, n):
+            if any(_np.isnan(v) for v in [fma[i-1], fma[i], sma[i-1], sma[i]]): continue
+            if fma[i-1] <= sma[i-1] and fma[i] > sma[i]: sig[i] =  1
+            if fma[i-1] >= sma[i-1] and fma[i] < sma[i]: sig[i] = -1
+
+    elif ind == "ema_cross":
+        fast_p = int(params.get("fast", 9))
+        slow_p = int(params.get("slow", 21))
+        fma = _bt_ema(close, fast_p)
+        sma = _bt_ema(close, slow_p)
+        for i in range(1, n):
+            if fma[i-1] <= sma[i-1] and fma[i] > sma[i]: sig[i] =  1
+            if fma[i-1] >= sma[i-1] and fma[i] < sma[i]: sig[i] = -1
+
+    else:
+        raise ValueError(
+            f"Unknown indicator '{indicator}'. "
+            "Supported: rsi, macd, bb, ma_cross, ema_cross"
+        )
+    return sig
+
+
+def _run_backtest(df, signals, freq="1D", initial_capital=10000.0, commission_pct=0.1):
+    import numpy as _np
+    close  = df["close"].values.astype(float)
+    opens  = df["open"].values.astype(float) if "open" in df.columns else close.copy()
+    dates  = df["date"].values
+    n      = len(close)
+    ann    = _bt_annualization(freq)
+
+    capital = initial_capital
+    shares  = 0.0
+    entry_price = entry_date = None
+    trades  = []
+    equity  = _np.zeros(n)
+    equity[0] = capital
+
+    for i in range(1, n):
+        exec_price = opens[i]
+        prev_sig   = signals[i-1]
+
+        if prev_sig == 1 and shares == 0.0 and exec_price > 0:
+            commission  = capital * commission_pct / 100.0
+            shares      = (capital - commission) / exec_price
+            entry_price = exec_price
+            entry_date  = dates[i]
+            capital     = 0.0
+
+        elif prev_sig == -1 and shares > 0.0:
+            proceeds   = shares * exec_price
+            commission = proceeds * commission_pct / 100.0
+            capital    = proceeds - commission
+            ret_pct    = (exec_price - entry_price) / entry_price * 100.0
+            trades.append({
+                "entry_date":  str(entry_date)[:10],
+                "exit_date":   str(dates[i])[:10],
+                "entry_price": round(float(entry_price), 4),
+                "exit_price":  round(float(exec_price), 4),
+                "return_pct":  round(ret_pct, 3),
+                "outcome":     "win" if ret_pct > 0 else "loss",
+            })
+            shares = 0.0
+
+        equity[i] = capital + shares * close[i]
+
+    if shares > 0.0:
+        exec_price = close[-1]
+        proceeds   = shares * exec_price
+        commission = proceeds * commission_pct / 100.0
+        capital    = proceeds - commission
+        ret_pct    = (exec_price - entry_price) / entry_price * 100.0
+        trades.append({
+            "entry_date":  str(entry_date)[:10],
+            "exit_date":   str(dates[-1])[:10],
+            "entry_price": round(float(entry_price), 4),
+            "exit_price":  round(float(close[-1]), 4),
+            "return_pct":  round(ret_pct, 3),
+            "outcome":     "win" if ret_pct > 0 else "loss",
+            "note":        "open position closed at last bar",
+        })
+        equity[-1] = capital
+
+    final_capital = float(equity[-1]) if equity[-1] > 0 else capital
+    strategy_return = (final_capital - initial_capital) / initial_capital * 100.0
+    bh_return       = (close[-1] - close[0]) / close[0] * 100.0
+    num_trades = len(trades)
+    wins   = [t for t in trades if t["outcome"] == "win"]
+    losses = [t for t in trades if t["outcome"] == "loss"]
+    win_rate     = len(wins) / num_trades * 100.0 if num_trades else 0.0
+    avg_win      = float(_np.mean([t["return_pct"] for t in wins]))   if wins   else 0.0
+    avg_loss     = float(_np.mean([t["return_pct"] for t in losses])) if losses else 0.0
+    gross_profit = sum(t["return_pct"] for t in wins)
+    gross_loss   = abs(sum(t["return_pct"] for t in losses))
+    profit_factor = round(gross_profit / gross_loss, 3) if gross_loss > 0 else None
+
+    peak   = _np.maximum.accumulate(equity)
+    dd     = _np.where(peak > 0, (equity - peak) / peak * 100.0, 0.0)
+    max_dd = float(_np.min(dd))
+
+    eq_ret = _np.diff(equity) / _np.where(equity[:-1] > 0, equity[:-1], 1.0)
+    eq_ret = eq_ret[~_np.isnan(eq_ret) & ~_np.isinf(eq_ret)]
+    sharpe = (float(_np.mean(eq_ret) / _np.std(eq_ret)) * ann
+              if len(eq_ret) > 1 and _np.std(eq_ret) > 0 else None)
+    calmar = (strategy_return / abs(max_dd) if max_dd < 0 else None)
+
+    return {
+        "strategy_return_pct":    round(strategy_return, 2),
+        "buy_and_hold_return_pct":round(bh_return, 2),
+        "outperformance_pct":     round(strategy_return - bh_return, 2),
+        "num_trades":             num_trades,
+        "win_rate_pct":           round(win_rate, 2),
+        "avg_win_pct":            round(avg_win, 3),
+        "avg_loss_pct":           round(avg_loss, 3),
+        "profit_factor":          profit_factor,
+        "max_drawdown_pct":       round(max_dd, 2),
+        "sharpe_ratio":           round(sharpe, 3) if sharpe is not None else None,
+        "calmar_ratio":           round(calmar, 3) if calmar is not None else None,
+        "initial_capital":        initial_capital,
+        "final_capital":          round(final_capital, 2),
+        "trades":                 trades,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 35: backtest_indicator
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def backtest_indicator(
+    symbol: str,
+    exchange: str = "NASDAQ",
+    freq: str = "1D",
+    bars: int = 500,
+    indicator: str = "rsi",
+    params: str = "{}",
+    initial_capital: float = 10000.0,
+    commission_pct: float = 0.1,
+) -> dict:
+    """
+    Backtest a single indicator strategy on historical OHLCV data and compare
+    it against a buy-and-hold baseline.
+
+    Args:
+        symbol: Ticker (e.g. "AAPL", "BTCUSD").
+        exchange: Exchange (e.g. "NASDAQ", "BINANCE").
+        freq: Bar frequency — "1D" (daily), "1W" (weekly), "60" (1-hour),
+              "240" (4-hour). Default "1D".
+        bars: Number of historical bars (min ~50, recommended 300-500).
+        indicator: Strategy to test. One of:
+                   "rsi"       — RSI mean-reversion
+                   "macd"      — MACD line crossover
+                   "bb"        — Bollinger Band mean-reversion
+                   "ma_cross"  — SMA golden/death cross
+                   "ema_cross" — EMA crossover
+        params: JSON string of indicator parameters. Defaults per indicator:
+                rsi       → {"period": 14, "oversold": 30, "overbought": 70}
+                macd      → {"fast": 12, "slow": 26, "signal": 9}
+                bb        → {"period": 20, "std_dev": 2.0}
+                ma_cross  → {"fast": 20, "slow": 50}
+                ema_cross → {"fast": 9, "slow": 21}
+        initial_capital: Starting capital in USD. Default 10000.
+        commission_pct: Commission as % of trade value. Default 0.1%.
+
+    Returns:
+        Dict with strategy_return_pct, buy_and_hold_return_pct,
+        outperformance_pct, num_trades, win_rate_pct, avg_win_pct,
+        avg_loss_pct, profit_factor, max_drawdown_pct, sharpe_ratio,
+        calmar_ratio, final_capital, and a full trades list.
+    """
+    if not NUMPY_OK:
+        raise RuntimeError("numpy/pandas not available.")
+    if not HISTORICAL_OK:
+        raise RuntimeError("TradingViewHistoricalFetcher unavailable.")
+
+    p  = json.loads(params) if params.strip() not in ("{}", "") else {}
+    df = _get_ohlcv_df(symbol, exchange, freq, bars)
+    df = df.reset_index(drop=True)
+    if "open" not in df.columns:
+        df["open"] = df["close"]
+
+    signals = _generate_signals(df, indicator, p)
+    result  = _run_backtest(df, signals, freq, initial_capital, commission_pct)
+    result.update({"symbol": symbol.upper(), "exchange": exchange.upper(),
+                   "freq": freq, "bars_used": len(df),
+                   "indicator": indicator, "params": p})
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Tool 36: backtest_optimize
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def backtest_optimize(
+    symbol: str,
+    exchange: str = "NASDAQ",
+    freq: str = "1D",
+    bars: int = 500,
+    indicator: str = "rsi",
+    param_grid: str = "{}",
+    rank_by: str = "sharpe_ratio",
+    top_n: int = 10,
+    initial_capital: float = 10000.0,
+    commission_pct: float = 0.1,
+) -> list[dict]:
+    """
+    Sweep a grid of indicator parameters and rank all combinations to find
+    the best settings for a given symbol and timeframe.
+
+    Args:
+        symbol: Ticker (e.g. "AAPL").
+        exchange: Exchange (e.g. "NASDAQ").
+        freq: Bar frequency. Default "1D".
+        bars: Historical bars. Default 500.
+        indicator: One of "rsi", "macd", "bb", "ma_cross", "ema_cross".
+        param_grid: JSON string mapping each parameter name to a list of values.
+                    RSI   → '{"period":[7,14,21],"oversold":[25,30,35],"overbought":[65,70,75]}'
+                    MACD  → '{"fast":[8,12,16],"slow":[21,26,30],"signal":[7,9,11]}'
+                    BB    → '{"period":[10,15,20,30],"std_dev":[1.5,2.0,2.5]}'
+                    MA    → '{"fast":[10,20,50],"slow":[50,100,200]}'
+                    EMA   → '{"fast":[5,9,12],"slow":[21,26,50]}'
+        rank_by: Metric to sort by: "sharpe_ratio", "strategy_return_pct",
+                 "profit_factor", "calmar_ratio", "win_rate_pct". Default "sharpe_ratio".
+        top_n: How many top combinations to return. Default 10.
+        initial_capital: Starting capital. Default 10000.
+        commission_pct: Commission % per trade. Default 0.1.
+
+    Returns:
+        List of top_n dicts with params + all performance metrics, best-first.
+    """
+    if not NUMPY_OK:
+        raise RuntimeError("numpy/pandas not available.")
+    if not HISTORICAL_OK:
+        raise RuntimeError("TradingViewHistoricalFetcher unavailable.")
+
+    grid = json.loads(param_grid) if param_grid.strip() not in ("{}", "") else {}
+    if not grid:
+        raise ValueError(
+            "param_grid must contain at least one parameter list. "
+            'Example: \'{"period": [7, 14, 21], "oversold": [25, 30]}\''
+        )
+
+    df = _get_ohlcv_df(symbol, exchange, freq, bars)
+    df = df.reset_index(drop=True)
+    if "open" not in df.columns:
+        df["open"] = df["close"]
+
+    param_names  = list(grid.keys())
+    combinations = list(itertools.product(*grid.values()))
+
+    results = []
+    for combo in combinations:
+        p = dict(zip(param_names, combo))
+        try:
+            signals = _generate_signals(df, indicator, p)
+            metrics = _run_backtest(df, signals, freq, initial_capital, commission_pct)
+            row = {k: v for k, v in metrics.items() if k != "trades"}
+            row["params"] = p
+            results.append(row)
+        except Exception:
+            pass
+
+    results.sort(key=lambda r: (r.get(rank_by) is None, -(r.get(rank_by) or 0)))
+    top = results[:top_n]
+    for i, r in enumerate(top):
+        r["rank"] = i + 1
+    return top
+
+
+# ---------------------------------------------------------------------------
+# Tool 37: backtest_compare
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def backtest_compare(
+    symbols: str,
+    exchange: str = "NASDAQ",
+    freq: str = "1D",
+    bars: int = 500,
+    indicator: str = "rsi",
+    params: str = "{}",
+    initial_capital: float = 10000.0,
+    commission_pct: float = 0.1,
+) -> list[dict]:
+    """
+    Run the same indicator strategy across multiple symbols side-by-side
+    to find which assets respond best to a given strategy.
+
+    Args:
+        symbols: Comma-separated tickers, e.g. "AAPL,MSFT,NVDA,GOOGL".
+                 For crypto: "BTCUSD,ETHUSD,SOLUSD". Max 20 symbols.
+        exchange: Exchange applied to all symbols. Default "NASDAQ".
+        freq: Bar frequency. Default "1D".
+        bars: Historical bars. Default 500.
+        indicator: One of "rsi", "macd", "bb", "ma_cross", "ema_cross".
+        params: JSON string of indicator parameters (applied to all symbols).
+        initial_capital: Starting capital per symbol. Default 10000.
+        commission_pct: Commission % per trade. Default 0.1.
+
+    Returns:
+        List sorted by strategy_return_pct descending, each entry has
+        symbol, all performance metrics, and the full trades list.
+    """
+    if not NUMPY_OK:
+        raise RuntimeError("numpy/pandas not available.")
+    if not HISTORICAL_OK:
+        raise RuntimeError("TradingViewHistoricalFetcher unavailable.")
+
+    symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()][:20]
+    if not symbol_list:
+        raise ValueError("Provide at least one symbol.")
+
+    p = json.loads(params) if params.strip() not in ("{}", "") else {}
+    results = []
+    for sym in symbol_list:
+        try:
+            df = _get_ohlcv_df(sym, exchange, freq, bars)
+            df = df.reset_index(drop=True)
+            if "open" not in df.columns:
+                df["open"] = df["close"]
+            signals = _generate_signals(df, indicator, p)
+            metrics = _run_backtest(df, signals, freq, initial_capital, commission_pct)
+            metrics.update({"symbol": sym, "exchange": exchange.upper(),
+                            "freq": freq, "bars_used": len(df),
+                            "indicator": indicator, "params": p})
+            results.append(metrics)
+        except Exception as e:
+            results.append({"symbol": sym, "exchange": exchange.upper(), "error": str(e)})
+
+    results.sort(key=lambda r: ("error" in r, -(r.get("strategy_return_pct") or float("-inf"))))
+    return results
 
 
 # ---------------------------------------------------------------------------
