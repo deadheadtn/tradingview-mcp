@@ -1,127 +1,205 @@
-# TradingView MCP Server
+# Trading Bot — TradingView MCP Server & Analysis Platform
 
-A Model Context Protocol (MCP) server that exposes TradingView market data to Claude and other MCP-compatible AI clients. No API key required.
+A stock analysis platform built around a **TradingView MCP server** that exposes 41 market-data tools to Claude and other AI agents, plus a Flask/React portfolio dashboard.
 
-## Features
+## MCP Server
 
-### Market Screening
-| Tool | Description |
-|------|-------------|
-| `screen_stocks` | Bulk screener with fundamentals, sector, price, and market cap filters |
-| `top_gainers` | Top performing assets for the current session |
-| `top_losers` | Biggest declining assets for the current session |
-| `bollinger_scan` | Find assets in BB squeeze, upper-touch, or lower-touch conditions |
-| `rating_filter` | Filter by TradingView's combined oscillator + MA rating |
-| `consecutive_candles_scan` | Scan for momentum across daily/weekly/monthly timeframes |
+The core of the project is `backend/mcp_server.py` — a [Model Context Protocol](https://modelcontextprotocol.io) server that gives AI agents direct access to TradingView data without rate limiting.
 
-### Technical Analysis
-| Tool | Description |
-|------|-------------|
-| `get_technical_analysis` | Full TA for a single symbol (RSI, MACD, BB, MAs, ADX, Stoch, Ichimoku) |
-| `coin_analysis` | Full TA optimised for crypto pairs |
-| `advanced_candle_pattern` | Multi-timeframe alignment analysis across custom intervals |
-| `get_bollinger_bands` | BB upper/lower/middle, width %, %B, squeeze flag |
-| `get_macd` | MACD line, signal, histogram, crossover direction |
-| `get_moving_averages` | SMA/EMA 10–200, price-above-MA flags, signal counts |
-| `get_stochastic` | %K, %D, overbought/oversold zone, crossover |
-| `get_adx` | ADX trend strength + DI+/DI- directional indicators |
-| `get_ichimoku_cloud` | Tenkan/Kijun/Span A/Span B, price vs cloud position |
-
-### Price & Market Data
-| Tool | Description |
-|------|-------------|
-| `get_price` | Current price and basic stats for a single symbol |
-| `get_multiple_prices` | Batch price quotes for arbitrary ticker lists |
-| `get_watchlist_data` | Bulk performance, volatility, beta, and technicals for any tickers |
-| `get_symbol_info` | Extended symbol info: 52w range, all performance periods, fundamentals |
-| `search_symbol` | Search for symbols by ticker or company name |
-
-### Price Levels & Computed Indicators
-| Tool | Description |
-|------|-------------|
-| `get_fibonacci_retracement` | Swing high/low → all fib levels + extensions |
-| `get_support_resistance` | Auto-detected S/R zones with touch-count strength |
-| `get_pivot_points` | Classic, Fibonacci, and Camarilla pivot points |
-| `get_atr` | ATR with volatility label (very_low → very_high) |
-| `get_vwap` | VWAP with price position vs average |
-| `get_volume_profile` | POC, value area, full price-bin volume distribution |
-| `detect_unfilled_gaps` | Bullish/bearish price gaps with fill status |
-| `calculate_correlation` | Pearson + Spearman + 30-bar rolling correlation |
-
-### Calendar & Events
-| Tool | Description |
-|------|-------------|
-| `get_earnings_calendar` | Upcoming earnings with EPS/revenue actuals, estimates, and surprises |
-| `get_ipo_calendar` | Upcoming and recent IPOs with offer price, deal size, market cap |
-| `get_bond_info` | Bonds related to a listed company (yield, maturity) |
-
-### Historical Data
-| Tool | Description |
-|------|-------------|
-| `get_historical_ohlcv` | OHLCV candlestick data via TradingView WebSocket (no API key) |
-
-### Other
-| Tool | Description |
-|------|-------------|
-| `list_available_pairs` | List forex pairs with base/quote currency filters |
-| `exchanges://list` | MCP resource listing all supported exchanges by region/asset class |
-
-## Installation
+### Running the server
 
 ```bash
+cd backend
 pip install -r requirements.txt
-```
-
-## Usage
-
-### Standalone
-
-```bash
 python mcp_server.py
 ```
 
-### With Claude Desktop
-
-Add to your `claude_desktop_config.json`:
+Add it to your Claude Code config (`.mcp.json`):
 
 ```json
 {
-  "mcpServers": {
-    "tradingview": {
-      "command": "python",
-      "args": ["/path/to/tradingview-mcp/mcp_server.py"]
-    }
+  "tradingview": {
+    "type": "stdio",
+    "command": "python",
+    "args": ["backend/mcp_server.py"]
   }
 }
 ```
 
-### With Claude Code (`.mcp.json`)
+### Available tools (41)
 
-```json
-{
-  "mcpServers": {
-    "tradingview": {
-      "type": "stdio",
-      "command": "python",
-      "args": ["/path/to/tradingview-mcp/mcp_server.py"]
-    }
-  }
-}
+#### Screening & prices
+| Tool | Description |
+|------|-------------|
+| `screen_stocks` | Bulk screener — filter by exchange, sector, price, market cap |
+| `get_price` | Current price for a single ticker |
+| `get_multiple_prices` | Prices for up to 100 tickers in one call |
+| `top_gainers` / `top_losers` | Biggest movers for the day |
+| `rating_filter` | Screen by TV recommendation (Buy/Sell/Neutral) |
+| `search_symbol` | Search for a ticker by name or keyword |
+| `get_symbol_info` | Company description, sector, country, exchange |
+
+#### Technical indicators
+| Tool | Description |
+|------|-------------|
+| `get_technical_analysis` | Full TA summary (RSI, MACD, MAs, oscillators, signal) |
+| `coin_analysis` | Same as above, optimised for crypto |
+| `get_bollinger_bands` | BB upper/middle/lower, width, %B, squeeze flag |
+| `get_macd` | MACD line, signal, histogram |
+| `get_moving_averages` | SMA/EMA across 5, 10, 20, 50, 100, 200 periods |
+| `get_stochastic` | %K, %D, crossover signal |
+| `get_adx` | ADX, +DI, -DI, trend strength |
+| `get_ichimoku_cloud` | Tenkan, Kijun, Senkou A/B, Chikou |
+| `get_atr` | Average True Range |
+| `get_vwap` | Volume-Weighted Average Price |
+
+#### Chart patterns & structure
+| Tool | Description |
+|------|-------------|
+| `get_fibonacci_retracement` | Fib levels from swing high/low |
+| `get_support_resistance` | Key S/R levels via pivot clustering |
+| `get_pivot_points` | Classic, Camarilla, Woodie pivots |
+| `get_volume_profile` | Volume by price bucket (POC, VAH, VAL) |
+| `detect_unfilled_gaps` | Open price gaps on the chart |
+| `consecutive_candles_scan` | Scan for N consecutive bullish/bearish candles |
+| `advanced_candle_pattern` | Doji, engulfing, hammer, shooting star, etc. |
+| `bollinger_scan` | Screen stocks near BB extremes |
+
+#### Historical data & correlation
+| Tool | Description |
+|------|-------------|
+| `get_historical_ohlcv` | OHLCV candles (1m → 1M) |
+| `calculate_correlation` | Pearson correlation between two symbols |
+| `list_available_pairs` | Browse forex pairs by base/quote currency |
+
+#### Options & volatility
+| Tool | Description |
+|------|-------------|
+| `get_iv_smile` | Implied-volatility smile by strike or delta for a specific expiry |
+| `get_iv_term_structure` | IV at standard tenors (1w/2w/1m/2m/3m/6m/9m/1y) and real expiries |
+
+#### Watchlists
+| Tool | Description |
+|------|-------------|
+| `get_watchlist_data` | Performance, volatility, RSI, rating for an explicit ticker list |
+| `get_watchlist_tickers` | Fetch tickers from a TradingView watchlist by its numeric ID |
+
+#### Calendars & bonds
+| Tool | Description |
+|------|-------------|
+| `get_earnings_calendar` | Upcoming earnings dates and EPS estimates |
+| `get_ipo_calendar` | Scheduled IPOs |
+| `get_bond_info` | Corporate bonds related to a stock (yield, maturity) |
+
+#### News
+| Tool | Description |
+|------|-------------|
+| `get_symbol_news` | Latest news articles for a ticker with pagination |
+
+#### Backtesting
+| Tool | Description |
+|------|-------------|
+| `backtest_indicator` | Run a single strategy on a symbol and get P&L metrics |
+| `backtest_optimize` | Grid-search indicator parameters for best return |
+| `backtest_compare` | Compare strategies across multiple symbols |
+
+#### Portfolio
+| Tool | Description |
+|------|-------------|
+| `get_portfolio_stocks` | Read the local SQLite portfolio database |
+
+---
+
+## Environment variables
+
+Copy `backend/.env.example` to `backend/.env` and fill in:
+
+```bash
+# TradingView session — required for get_watchlist_tickers
+# Copy from browser cookies while logged into tradingview.com
+TV_SESSION_ID=your_sessionid_cookie
+TV_SESSION_SIGN=your_sessionid_sign_cookie
+
+# Revolut API (optional — for portfolio sync)
+REVOLUT_CREDENTIALS=...
+REVOLUT_REFRESH_TOKEN=...
+REVOLUT_DEVICE_ID=...
 ```
 
-## Data Sources
+---
 
-- **Screener data** — `tradingview-screener` Python package (scanner.tradingview.com)
-- **Technical analysis** — `tradingview-ta` Python package
-- **Historical OHLCV** — TradingView WebSocket API (`wss://data.tradingview.com`)
-- **Events & symbol info** — TradingView Scanner REST API (public endpoints)
+## Web dashboard (Flask + React)
 
-All endpoints are public and require no authentication.
+A portfolio tracking dashboard runs alongside the MCP server.
 
-## Dependencies
+### Backend
 
-- `mcp` — Model Context Protocol SDK
-- `tradingview-screener` — TradingView screener wrapper
-- `tradingview-ta` — TradingView technical analysis
-- `websocket-client` — WebSocket for historical data
-- `requests`, `pandas`, `numpy`, `scipy`
+```bash
+cd backend
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+python app.py          # http://localhost:5000
+```
+
+### Frontend
+
+```bash
+cd frontend
+npm install
+npm start              # http://localhost:3000
+```
+
+### REST API
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/stocks` | List tracked stocks |
+| `POST /api/stocks` | Add a stock |
+| `GET /api/stocks/:symbol` | Full analysis |
+| `GET /api/stocks/:symbol/chart` | Price history |
+| `GET /api/stocks/:symbol/technicals` | Technical indicators |
+| `POST /api/alerts` | Create price alert |
+| `GET /api/portfolio` | Portfolio summary |
+
+---
+
+## Project structure
+
+```
+trading-bot/
+├── backend/
+│   ├── mcp_server.py        # TradingView MCP server (41 tools)
+│   ├── app.py               # Flask REST API
+│   ├── config.py
+│   ├── models.py
+│   ├── requirements.txt
+│   ├── .env                 # Secrets (not committed)
+│   ├── .env.example
+│   ├── services/            # Data fetchers, analyzers, scorers
+│   ├── migrations/
+│   └── tests/
+├── frontend/
+│   ├── src/
+│   │   ├── App.js
+│   │   └── components/
+│   └── package.json
+├── instance/
+│   └── trading_bot.db       # SQLite database
+└── docs/                    # Additional guides
+```
+
+---
+
+## Tech stack
+
+- **MCP server**: Python, [FastMCP](https://github.com/jlowin/fastmcp), TradingView public APIs
+- **Backend**: Python 3.9+, Flask, SQLAlchemy, Pandas, NumPy
+- **Frontend**: React 18, Chart.js, TailwindCSS
+- **Database**: SQLite
+
+---
+
+## Disclaimer
+
+For educational and informational purposes only. Not financial advice.

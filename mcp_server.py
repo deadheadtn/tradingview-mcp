@@ -5,7 +5,9 @@ Exposes TradingView market data to Claude via the Model Context Protocol.
 Run via: python mcp_server.py
 """
 
+import sys
 import os
+import sqlite3
 import math
 import logging
 import json
@@ -14,6 +16,15 @@ from datetime import datetime, timedelta
 from typing import Optional, List
 
 import requests
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass
+
+# Ensure backend packages are importable
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mcp.server.fastmcp import FastMCP
 
@@ -43,7 +54,7 @@ except ImportError:
     TA_OK = False
 
 try:
-    from tradingview_historical_fetcher import TradingViewHistoricalFetcher
+    from services.tradingview_historical_fetcher import TradingViewHistoricalFetcher
     HISTORICAL_OK = True
 except Exception:
     HISTORICAL_OK = False
@@ -51,6 +62,11 @@ except Exception:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+DB_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "instance", "trading_bot.db"
+)
 
 INTERVAL_MAP = {
     "1m":  Interval.INTERVAL_1_MINUTE   if TA_OK else None,
@@ -83,8 +99,6 @@ def _clean_dict(d: dict) -> dict:
 # Scanner / REST API helper
 # ---------------------------------------------------------------------------
 
-
-
 _SCANNER_HEADERS = {
     "accept": "application/json",
     "content-type": "text/plain;charset=UTF-8",
@@ -114,11 +128,10 @@ mcp = FastMCP(
         "Provides real-time and historical market data from TradingView. "
         "Use screen_stocks to scan markets in bulk, get_technical_analysis for "
         "indicators on a single symbol, get_historical_ohlcv for candlestick data, "
-        "top_gainers/top_losers for movers, bollinger_scan for breakout setups, "
-        "get_earnings_calendar and get_ipo_calendar for events, "
-        "get_fibonacci_retracement, get_support_resistance, get_pivot_points "
-        "for price levels, get_volume_profile for market structure, "
-        "and calculate_correlation for pair analysis."
+        "get_portfolio_stocks to inspect the local trading-bot portfolio, "
+        "get_iv_smile for the options volatility smile by strike/delta, "
+        "get_iv_term_structure for the IV term structure across tenors, "
+        "and get_symbol_news for the latest news on a ticker."
     ),
 )
 
@@ -429,7 +442,72 @@ def get_historical_ohlcv(
 
 
 # ---------------------------------------------------------------------------
-# Tool 4: Symbol search
+# Tool 4: Portfolio stocks from local DB
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_portfolio_stocks(
+    search: Optional[str] = None,
+    sector: Optional[str] = None,
+    limit: int = 100,
+) -> list[dict]:
+    """
+    Return stocks tracked in the local trading-bot portfolio database.
+
+    Args:
+        search: Optional filter — matches against symbol or company name
+                (case-insensitive substring match).
+        sector: Optional sector filter (exact match).
+        limit: Maximum rows to return (default 100).
+
+    Returns:
+        List of dicts with symbol, name, exchange, sector, current_price,
+        pe_ratio, total_score, recommendation, last_updated, and more.
+    """
+    if not os.path.exists(DB_PATH):
+        raise RuntimeError(f"Database not found at {DB_PATH}")
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    sql = """
+        SELECT
+            symbol, name, exchange, country, sector, industry,
+            market_cap, current_price, day_change, day_change_percent,
+            pe_ratio, pb_ratio, peg_ratio,
+            debt_to_equity, current_ratio, quick_ratio,
+            gross_margin, operating_margin, net_margin,
+            roe, roa, revenue_growth, earnings_growth,
+            dividend_yield, payout_ratio,
+            beta, volatility, volume, avg_volume,
+            total_score, valuation_score, financial_health_score,
+            profitability_score, growth_score, technical_score, risk_score,
+            recommendation, data_fetched, last_updated
+        FROM stocks
+        WHERE is_active = 1
+    """
+    params: list = []
+
+    if search:
+        sql += " AND (UPPER(symbol) LIKE UPPER(?) OR UPPER(name) LIKE UPPER(?))"
+        params += [f"%{search}%", f"%{search}%"]
+
+    if sector:
+        sql += " AND sector = ?"
+        params.append(sector)
+
+    sql += " ORDER BY total_score DESC NULLS LAST LIMIT ?"
+    params.append(limit)
+
+    cur.execute(sql, params)
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Tool 5: Symbol search
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -2554,61 +2632,68 @@ def list_exchanges() -> str:
 # ---------------------------------------------------------------------------
 
 def _bt_annualization(freq: str) -> float:
+    """Return the annualization factor (sqrt of periods per year) for Sharpe."""
     freq = freq.upper()
-    if freq in ("1D", "D"):   return math.sqrt(252)
-    if freq in ("1W", "W"):   return math.sqrt(52)
-    if freq in ("1M", "M"):   return math.sqrt(12)
-    if freq == "240":          return math.sqrt(252 * 6.5 / 4)
-    if freq == "60":           return math.sqrt(252 * 6.5)
-    if freq == "30":           return math.sqrt(252 * 6.5 * 2)
-    if freq == "15":           return math.sqrt(252 * 6.5 * 4)
-    if freq == "5":            return math.sqrt(252 * 6.5 * 12)
-    return math.sqrt(252)
+    if freq in ("1D", "D"):         return math.sqrt(252)
+    if freq in ("1W", "W"):         return math.sqrt(52)
+    if freq in ("1M", "M"):         return math.sqrt(12)
+    if freq == "240":               return math.sqrt(252 * 6.5 / 4)   # 4-hour
+    if freq == "60":                return math.sqrt(252 * 6.5)        # 1-hour
+    if freq == "30":                return math.sqrt(252 * 6.5 * 2)
+    if freq == "15":                return math.sqrt(252 * 6.5 * 4)
+    if freq == "5":                 return math.sqrt(252 * 6.5 * 12)
+    return math.sqrt(252)           # fallback
 
 
-def _bt_rsi(close, period=14):
+def _bt_rsi(close: "np.ndarray", period: int = 14) -> "np.ndarray":
     import pandas as _pd, numpy as _np
     delta = _np.diff(close, prepend=close[0])
     gain  = _np.where(delta > 0, delta, 0.0)
     loss  = _np.where(delta < 0, -delta, 0.0)
-    avg_g = _pd.Series(gain).ewm(alpha=1.0/period, adjust=False).mean().values
-    avg_l = _pd.Series(loss).ewm(alpha=1.0/period, adjust=False).mean().values
+    avg_g = _pd.Series(gain).ewm(alpha=1.0 / period, adjust=False).mean().values
+    avg_l = _pd.Series(loss).ewm(alpha=1.0 / period, adjust=False).mean().values
     rs    = _np.where(avg_l == 0, _np.inf, avg_g / avg_l)
     return 100.0 - (100.0 / (1.0 + rs))
 
 
-def _bt_macd(close, fast=12, slow=26, signal=9):
+def _bt_macd(close: "np.ndarray", fast=12, slow=26, signal=9):
     import pandas as _pd
-    s = _pd.Series(close)
+    s    = _pd.Series(close)
     macd = (s.ewm(span=fast, adjust=False).mean()
            - s.ewm(span=slow, adjust=False).mean()).values
     sig  = _pd.Series(macd).ewm(span=signal, adjust=False).mean().values
     return macd, sig
 
 
-def _bt_bb(close, period=20, std_dev=2.0):
+def _bt_bb(close: "np.ndarray", period=20, std_dev=2.0):
     import pandas as _pd
     s   = _pd.Series(close)
     mid = s.rolling(period).mean()
     std = s.rolling(period).std()
-    return (mid + std_dev*std).values, mid.values, (mid - std_dev*std).values
+    return (mid + std_dev * std).values, mid.values, (mid - std_dev * std).values
 
 
-def _bt_sma(close, period):
+def _bt_sma(close: "np.ndarray", period: int) -> "np.ndarray":
     import pandas as _pd
     return _pd.Series(close).rolling(period).mean().values
 
 
-def _bt_ema(close, period):
+def _bt_ema(close: "np.ndarray", period: int) -> "np.ndarray":
     import pandas as _pd
     return _pd.Series(close).ewm(span=period, adjust=False).mean().values
 
 
-def _generate_signals(df, indicator: str, params: dict):
+def _generate_signals(df: "pd.DataFrame", indicator: str, params: dict) -> "np.ndarray":
+    """
+    Produce a signal array aligned to df rows: 1=buy, -1=sell, 0=hold.
+    Signals are set on the bar that triggers them; execution happens on the
+    NEXT bar's open inside _run_backtest.
+    """
     import numpy as _np
     close = df["close"].values.astype(float)
     n = len(close)
     sig = _np.zeros(n, dtype=int)
+
     ind = indicator.lower().replace("-", "_")
 
     if ind == "rsi":
@@ -2617,8 +2702,8 @@ def _generate_signals(df, indicator: str, params: dict):
         overbought = float(params.get("overbought", 70))
         rsi = _bt_rsi(close, period)
         for i in range(1, n):
-            if rsi[i-1] <= oversold  and rsi[i] > oversold:   sig[i] =  1
-            if rsi[i-1] >= overbought and rsi[i] < overbought: sig[i] = -1
+            if rsi[i - 1] <= oversold  and rsi[i] > oversold:   sig[i] =  1
+            if rsi[i - 1] >= overbought and rsi[i] < overbought: sig[i] = -1
 
     elif ind == "macd":
         fast   = int(params.get("fast", 12))
@@ -2626,76 +2711,88 @@ def _generate_signals(df, indicator: str, params: dict):
         signal = int(params.get("signal", 9))
         macd, sig_line = _bt_macd(close, fast, slow, signal)
         for i in range(1, n):
-            if macd[i-1] <= sig_line[i-1] and macd[i] > sig_line[i]: sig[i] =  1
-            if macd[i-1] >= sig_line[i-1] and macd[i] < sig_line[i]: sig[i] = -1
+            if macd[i - 1] <= sig_line[i - 1] and macd[i] > sig_line[i]: sig[i] =  1
+            if macd[i - 1] >= sig_line[i - 1] and macd[i] < sig_line[i]: sig[i] = -1
 
     elif ind in ("bb", "bollinger", "bollinger_bands"):
         period  = int(params.get("period", 20))
         std_dev = float(params.get("std_dev", 2.0))
         upper, mid, lower = _bt_bb(close, period, std_dev)
         for i in range(1, n):
-            if _np.isnan(lower[i]) or _np.isnan(upper[i]): continue
-            if close[i-1] >= lower[i-1] and close[i] < lower[i]: sig[i] =  1
-            if close[i-1] <= upper[i-1] and close[i] > upper[i]: sig[i] = -1
+            if _np.isnan(lower[i]) or _np.isnan(upper[i]):
+                continue
+            if close[i - 1] >= lower[i - 1] and close[i] < lower[i]: sig[i] =  1
+            if close[i - 1] <= upper[i - 1] and close[i] > upper[i]: sig[i] = -1
 
     elif ind in ("ma_cross", "sma_cross"):
         fast_p = int(params.get("fast", 20))
         slow_p = int(params.get("slow", 50))
-        fma = _bt_sma(close, fast_p)
-        sma = _bt_sma(close, slow_p)
+        fast_ma = _bt_sma(close, fast_p)
+        slow_ma = _bt_sma(close, slow_p)
         for i in range(1, n):
-            if any(_np.isnan(v) for v in [fma[i-1], fma[i], sma[i-1], sma[i]]): continue
-            if fma[i-1] <= sma[i-1] and fma[i] > sma[i]: sig[i] =  1
-            if fma[i-1] >= sma[i-1] and fma[i] < sma[i]: sig[i] = -1
+            if any(_np.isnan(v) for v in [fast_ma[i-1], fast_ma[i], slow_ma[i-1], slow_ma[i]]):
+                continue
+            if fast_ma[i - 1] <= slow_ma[i - 1] and fast_ma[i] > slow_ma[i]: sig[i] =  1
+            if fast_ma[i - 1] >= slow_ma[i - 1] and fast_ma[i] < slow_ma[i]: sig[i] = -1
 
-    elif ind == "ema_cross":
+    elif ind in ("ema_cross",):
         fast_p = int(params.get("fast", 9))
         slow_p = int(params.get("slow", 21))
-        fma = _bt_ema(close, fast_p)
-        sma = _bt_ema(close, slow_p)
+        fast_ma = _bt_ema(close, fast_p)
+        slow_ma = _bt_ema(close, slow_p)
         for i in range(1, n):
-            if fma[i-1] <= sma[i-1] and fma[i] > sma[i]: sig[i] =  1
-            if fma[i-1] >= sma[i-1] and fma[i] < sma[i]: sig[i] = -1
+            if fast_ma[i - 1] <= slow_ma[i - 1] and fast_ma[i] > slow_ma[i]: sig[i] =  1
+            if fast_ma[i - 1] >= slow_ma[i - 1] and fast_ma[i] < slow_ma[i]: sig[i] = -1
 
     else:
         raise ValueError(
             f"Unknown indicator '{indicator}'. "
             "Supported: rsi, macd, bb, ma_cross, ema_cross"
         )
+
     return sig
 
 
-def _run_backtest(df, signals, freq="1D", initial_capital=10000.0, commission_pct=0.1):
+def _run_backtest(
+    df: "pd.DataFrame",
+    signals: "np.ndarray",
+    freq: str = "1D",
+    initial_capital: float = 10_000.0,
+    commission_pct: float = 0.1,
+) -> dict:
+    """Simulate trades from a signal array and return full metrics + trade log."""
     import numpy as _np
+
     close  = df["close"].values.astype(float)
     opens  = df["open"].values.astype(float) if "open" in df.columns else close.copy()
     dates  = df["date"].values
     n      = len(close)
     ann    = _bt_annualization(freq)
 
-    capital = initial_capital
-    shares  = 0.0
-    entry_price = entry_date = None
-    trades  = []
-    equity  = _np.zeros(n)
-    equity[0] = capital
+    capital      = initial_capital
+    shares       = 0.0
+    entry_price  = 0.0
+    entry_date   = None
+    trades       = []
+    equity       = _np.zeros(n)
+    equity[0]    = capital
 
     for i in range(1, n):
         exec_price = opens[i]
-        prev_sig   = signals[i-1]
+        prev_sig   = signals[i - 1]
 
         if prev_sig == 1 and shares == 0.0 and exec_price > 0:
-            commission  = capital * commission_pct / 100.0
-            shares      = (capital - commission) / exec_price
-            entry_price = exec_price
-            entry_date  = dates[i]
-            capital     = 0.0
+            commission   = capital * commission_pct / 100.0
+            shares       = (capital - commission) / exec_price
+            entry_price  = exec_price
+            entry_date   = dates[i]
+            capital      = 0.0
 
         elif prev_sig == -1 and shares > 0.0:
-            proceeds   = shares * exec_price
-            commission = proceeds * commission_pct / 100.0
-            capital    = proceeds - commission
-            ret_pct    = (exec_price - entry_price) / entry_price * 100.0
+            proceeds     = shares * exec_price
+            commission   = proceeds * commission_pct / 100.0
+            capital      = proceeds - commission
+            ret_pct      = (exec_price - entry_price) / entry_price * 100.0
             trades.append({
                 "entry_date":  str(entry_date)[:10],
                 "exit_date":   str(dates[i])[:10],
@@ -2708,45 +2805,54 @@ def _run_backtest(df, signals, freq="1D", initial_capital=10000.0, commission_pc
 
         equity[i] = capital + shares * close[i]
 
+    # Close any open position at the last bar
     if shares > 0.0:
-        exec_price = close[-1]
-        proceeds   = shares * exec_price
-        commission = proceeds * commission_pct / 100.0
-        capital    = proceeds - commission
-        ret_pct    = (exec_price - entry_price) / entry_price * 100.0
+        exec_price   = close[-1]
+        proceeds     = shares * exec_price
+        commission   = proceeds * commission_pct / 100.0
+        capital      = proceeds - commission
+        ret_pct      = (exec_price - entry_price) / entry_price * 100.0
         trades.append({
             "entry_date":  str(entry_date)[:10],
             "exit_date":   str(dates[-1])[:10],
             "entry_price": round(float(entry_price), 4),
-            "exit_price":  round(float(close[-1]), 4),
+            "exit_price":  round(float(exec_price), 4),
             "return_pct":  round(ret_pct, 3),
             "outcome":     "win" if ret_pct > 0 else "loss",
             "note":        "open position closed at last bar",
         })
-        equity[-1] = capital
+        equity[-1]   = capital
 
     final_capital = float(equity[-1]) if equity[-1] > 0 else capital
+
+    # --- Core metrics ---
     strategy_return = (final_capital - initial_capital) / initial_capital * 100.0
     bh_return       = (close[-1] - close[0]) / close[0] * 100.0
-    num_trades = len(trades)
+    num_trades      = len(trades)
+
     wins   = [t for t in trades if t["outcome"] == "win"]
     losses = [t for t in trades if t["outcome"] == "loss"]
-    win_rate     = len(wins) / num_trades * 100.0 if num_trades else 0.0
-    avg_win      = float(_np.mean([t["return_pct"] for t in wins]))   if wins   else 0.0
-    avg_loss     = float(_np.mean([t["return_pct"] for t in losses])) if losses else 0.0
+    win_rate   = len(wins) / num_trades * 100.0 if num_trades else 0.0
+    avg_win    = float(_np.mean([t["return_pct"] for t in wins]))   if wins   else 0.0
+    avg_loss   = float(_np.mean([t["return_pct"] for t in losses])) if losses else 0.0
     gross_profit = sum(t["return_pct"] for t in wins)
     gross_loss   = abs(sum(t["return_pct"] for t in losses))
     profit_factor = round(gross_profit / gross_loss, 3) if gross_loss > 0 else None
 
+    # Max drawdown
     peak   = _np.maximum.accumulate(equity)
     dd     = _np.where(peak > 0, (equity - peak) / peak * 100.0, 0.0)
     max_dd = float(_np.min(dd))
 
+    # Sharpe (annualised)
     eq_ret = _np.diff(equity) / _np.where(equity[:-1] > 0, equity[:-1], 1.0)
     eq_ret = eq_ret[~_np.isnan(eq_ret) & ~_np.isinf(eq_ret)]
     sharpe = (float(_np.mean(eq_ret) / _np.std(eq_ret)) * ann
               if len(eq_ret) > 1 and _np.std(eq_ret) > 0 else None)
-    calmar = (strategy_return / abs(max_dd) if max_dd < 0 else None)
+
+    # Calmar
+    calmar = (strategy_return / abs(max_dd)
+              if max_dd < 0 else None)
 
     return {
         "strategy_return_pct":    round(strategy_return, 2),
@@ -2790,7 +2896,7 @@ def backtest_indicator(
         exchange: Exchange (e.g. "NASDAQ", "BINANCE").
         freq: Bar frequency — "1D" (daily), "1W" (weekly), "60" (1-hour),
               "240" (4-hour). Default "1D".
-        bars: Number of historical bars (min ~50, recommended 300-500).
+        bars: Number of historical bars to use (min ~50, recommended 300-500).
         indicator: Strategy to test. One of:
                    "rsi"       — RSI mean-reversion
                    "macd"      — MACD line crossover
@@ -2804,7 +2910,7 @@ def backtest_indicator(
                 ma_cross  → {"fast": 20, "slow": 50}
                 ema_cross → {"fast": 9, "slow": 21}
         initial_capital: Starting capital in USD. Default 10000.
-        commission_pct: Commission as % of trade value. Default 0.1%.
+        commission_pct: Round-trip commission as % of trade value. Default 0.1%.
 
     Returns:
         Dict with strategy_return_pct, buy_and_hold_return_pct,
@@ -2817,17 +2923,22 @@ def backtest_indicator(
     if not HISTORICAL_OK:
         raise RuntimeError("TradingViewHistoricalFetcher unavailable.")
 
-    p  = json.loads(params) if params.strip() not in ("{}", "") else {}
+    p = json.loads(params) if params.strip() not in ("{}", "") else {}
     df = _get_ohlcv_df(symbol, exchange, freq, bars)
     df = df.reset_index(drop=True)
+
     if "open" not in df.columns:
         df["open"] = df["close"]
 
     signals = _generate_signals(df, indicator, p)
     result  = _run_backtest(df, signals, freq, initial_capital, commission_pct)
-    result.update({"symbol": symbol.upper(), "exchange": exchange.upper(),
-                   "freq": freq, "bars_used": len(df),
-                   "indicator": indicator, "params": p})
+
+    result["symbol"]    = symbol.upper()
+    result["exchange"]  = exchange.upper()
+    result["freq"]      = freq
+    result["bars_used"] = len(df)
+    result["indicator"] = indicator
+    result["params"]    = p
     return result
 
 
@@ -2850,7 +2961,7 @@ def backtest_optimize(
 ) -> list[dict]:
     """
     Sweep a grid of indicator parameters and rank all combinations to find
-    the best settings for a given symbol and timeframe.
+    the best-performing settings for a given symbol and timeframe.
 
     Args:
         symbol: Ticker (e.g. "AAPL").
@@ -2858,20 +2969,22 @@ def backtest_optimize(
         freq: Bar frequency. Default "1D".
         bars: Historical bars. Default 500.
         indicator: One of "rsi", "macd", "bb", "ma_cross", "ema_cross".
-        param_grid: JSON string mapping each parameter name to a list of values.
+        param_grid: JSON string mapping each parameter name to a list of
+                    values to try. Examples:
                     RSI   → '{"period":[7,14,21],"oversold":[25,30,35],"overbought":[65,70,75]}'
                     MACD  → '{"fast":[8,12,16],"slow":[21,26,30],"signal":[7,9,11]}'
                     BB    → '{"period":[10,15,20,30],"std_dev":[1.5,2.0,2.5]}'
                     MA    → '{"fast":[10,20,50],"slow":[50,100,200]}'
                     EMA   → '{"fast":[5,9,12],"slow":[21,26,50]}'
-        rank_by: Metric to sort by: "sharpe_ratio", "strategy_return_pct",
+        rank_by: Metric to sort by. One of "sharpe_ratio", "strategy_return_pct",
                  "profit_factor", "calmar_ratio", "win_rate_pct". Default "sharpe_ratio".
-        top_n: How many top combinations to return. Default 10.
+        top_n: Number of top combinations to return. Default 10.
         initial_capital: Starting capital. Default 10000.
         commission_pct: Commission % per trade. Default 0.1.
 
     Returns:
-        List of top_n dicts with params + all performance metrics, best-first.
+        List of top_n dicts, each with the parameter combination and all
+        performance metrics, sorted best-first by rank_by.
     """
     if not NUMPY_OK:
         raise RuntimeError("numpy/pandas not available.")
@@ -2891,7 +3004,8 @@ def backtest_optimize(
         df["open"] = df["close"]
 
     param_names  = list(grid.keys())
-    combinations = list(itertools.product(*grid.values()))
+    param_values = list(grid.values())
+    combinations = list(itertools.product(*param_values))
 
     results = []
     for combo in combinations:
@@ -2901,11 +3015,16 @@ def backtest_optimize(
             metrics = _run_backtest(df, signals, freq, initial_capital, commission_pct)
             row = {k: v for k, v in metrics.items() if k != "trades"}
             row["params"] = p
+            row["num_trades"] = metrics["num_trades"]
             results.append(row)
         except Exception:
-            pass
+            pass  # skip invalid param combos silently
 
-    results.sort(key=lambda r: (r.get(rank_by) is None, -(r.get(rank_by) or 0)))
+    valid_key = rank_by if rank_by in (results[0] if results else {}) else "sharpe_ratio"
+    results.sort(
+        key=lambda r: (r.get(valid_key) is None, -(r.get(valid_key) or 0)),
+    )
+
     top = results[:top_n]
     for i, r in enumerate(top):
         r["rank"] = i + 1
@@ -2928,8 +3047,8 @@ def backtest_compare(
     commission_pct: float = 0.1,
 ) -> list[dict]:
     """
-    Run the same indicator strategy across multiple symbols side-by-side
-    to find which assets respond best to a given strategy.
+    Run the same indicator strategy across multiple symbols side-by-side,
+    useful for finding which assets respond best to a given strategy.
 
     Args:
         symbols: Comma-separated tickers, e.g. "AAPL,MSFT,NVDA,GOOGL".
@@ -2938,13 +3057,13 @@ def backtest_compare(
         freq: Bar frequency. Default "1D".
         bars: Historical bars. Default 500.
         indicator: One of "rsi", "macd", "bb", "ma_cross", "ema_cross".
-        params: JSON string of indicator parameters (applied to all symbols).
+        params: JSON string of indicator parameters (same for all symbols).
         initial_capital: Starting capital per symbol. Default 10000.
         commission_pct: Commission % per trade. Default 0.1.
 
     Returns:
-        List sorted by strategy_return_pct descending, each entry has
-        symbol, all performance metrics, and the full trades list.
+        List of result dicts sorted by strategy_return_pct descending,
+        each with symbol, all performance metrics, and the trades list.
     """
     if not NUMPY_OK:
         raise RuntimeError("numpy/pandas not available.")
@@ -2956,6 +3075,7 @@ def backtest_compare(
         raise ValueError("Provide at least one symbol.")
 
     p = json.loads(params) if params.strip() not in ("{}", "") else {}
+
     results = []
     for sym in symbol_list:
         try:
@@ -2965,15 +3085,302 @@ def backtest_compare(
                 df["open"] = df["close"]
             signals = _generate_signals(df, indicator, p)
             metrics = _run_backtest(df, signals, freq, initial_capital, commission_pct)
-            metrics.update({"symbol": sym, "exchange": exchange.upper(),
-                            "freq": freq, "bars_used": len(df),
-                            "indicator": indicator, "params": p})
+            metrics["symbol"]    = sym
+            metrics["exchange"]  = exchange.upper()
+            metrics["freq"]      = freq
+            metrics["bars_used"] = len(df)
+            metrics["indicator"] = indicator
+            metrics["params"]    = p
             results.append(metrics)
         except Exception as e:
-            results.append({"symbol": sym, "exchange": exchange.upper(), "error": str(e)})
+            results.append({
+                "symbol":  sym,
+                "exchange":exchange.upper(),
+                "error":   str(e),
+            })
 
-    results.sort(key=lambda r: ("error" in r, -(r.get("strategy_return_pct") or float("-inf"))))
+    results.sort(
+        key=lambda r: (
+            "error" in r,
+            -(r.get("strategy_return_pct") or float("-inf")),
+        )
+    )
     return results
+
+
+# ---------------------------------------------------------------------------
+# Tool 36: Fetch tickers from a TradingView watchlist by ID
+# ---------------------------------------------------------------------------
+
+def _tv_session_cookies(session_id: Optional[str], session_sign: Optional[str]) -> dict:
+    """Build cookie dict from args or env fallback."""
+    sid  = session_id   or os.environ.get("TV_SESSION_ID",   "")
+    sign = session_sign or os.environ.get("TV_SESSION_SIGN", "")
+    if not sid:
+        raise RuntimeError(
+            "TradingView session credentials required. "
+            "Set TV_SESSION_ID (and optionally TV_SESSION_SIGN) in .env, "
+            "or pass session_id to the tool."
+        )
+    cookies = {"sessionid": sid}
+    if sign:
+        cookies["sessionid_sign"] = sign
+    return cookies
+
+
+@mcp.tool()
+def get_watchlist_tickers(
+    watchlist_id: str,
+    with_data: bool = True,
+    session_id: Optional[str] = None,
+    session_sign: Optional[str] = None,
+) -> dict:
+    """
+    Fetch all tickers from a TradingView watchlist by its numeric ID,
+    then optionally enrich them with performance and technical data.
+
+    Requires a TradingView session. Set TV_SESSION_ID and TV_SESSION_SIGN
+    in the .env file (copy them from your browser cookies while logged in),
+    or pass them directly as session_id / session_sign.
+
+    Args:
+        watchlist_id: Numeric watchlist ID (visible in the URL, e.g. "21673382").
+        with_data: If True (default), enrich each ticker with performance,
+                   volatility, RSI, and TV rating via the scanner API.
+        session_id: TradingView sessionid cookie (overrides TV_SESSION_ID env var).
+        session_sign: TradingView sessionid_sign cookie (overrides TV_SESSION_SIGN env var).
+
+    Returns:
+        Dict with:
+          - watchlist_id, name (if available), ticker_count.
+          - tickers: list of "EXCHANGE:SYMBOL" strings.
+          - data: (only when with_data=True) enriched list from get_watchlist_data.
+    """
+    cookies = _tv_session_cookies(session_id, session_sign)
+
+    url = f"https://www.tradingview.com/api/v1/symbols_list/custom/{watchlist_id}/"
+    headers = {
+        "accept": "*/*",
+        "origin": "https://www.tradingview.com",
+        "referer": f"https://www.tradingview.com/watchlists/{watchlist_id}/",
+        "user-agent": "Mozilla/5.0 (compatible; TradingBot/1.0)",
+        "x-language": "en",
+        "x-requested-with": "XMLHttpRequest",
+    }
+    resp = requests.get(url, headers=headers, cookies=cookies,
+                        params={"source": "web"}, timeout=20)
+    resp.raise_for_status()
+    raw = resp.json()
+
+    # Parse tickers — TradingView returns one of two shapes:
+    #   {"symbols": {"content": [{"symbol": "NASDAQ:AAPL"}, ...]}}
+    #   {"symbols": ["NASDAQ:AAPL", ...]}
+    name = raw.get("name") or raw.get("title") or ""
+    syms_raw = raw.get("symbols", raw.get("tickers", []))
+    if isinstance(syms_raw, dict):
+        content = syms_raw.get("content", [])
+        tickers = [
+            (item.get("symbol") or item.get("name") or "").upper()
+            for item in content
+            if isinstance(item, dict)
+        ]
+    elif isinstance(syms_raw, list):
+        tickers = []
+        for item in syms_raw:
+            if isinstance(item, str):
+                tickers.append(item.upper())
+            elif isinstance(item, dict):
+                sym = item.get("symbol") or item.get("name") or ""
+                if sym:
+                    tickers.append(sym.upper())
+    else:
+        tickers = []
+
+    tickers = [t for t in tickers if t]
+
+    result: dict = {
+        "watchlist_id":  watchlist_id,
+        "name":          name,
+        "ticker_count":  len(tickers),
+        "tickers":       tickers,
+    }
+
+    if with_data and tickers:
+        result["data"] = get_watchlist_data(
+            tickers=",".join(tickers),
+            include_technicals=True,
+        )
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Tool 38: Options implied-volatility smile (by strike or delta)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_iv_smile(
+    symbol: str,
+    exchange: str = "NASDAQ",
+    expiry: str = "",
+    xaxis: str = "strikes",
+) -> dict:
+    """
+    Get the implied-volatility smile (skew curve) for a specific option expiry.
+
+    Args:
+        symbol: Underlying ticker (e.g. "AAPL", "KLAC").
+        exchange: Exchange of the underlying (e.g. "NASDAQ", "NYSE").
+        expiry: Option expiry date in YYYY-MM-DD format (e.g. "2026-07-17").
+        xaxis: X-axis type: "strikes" (default) returns absolute strike prices;
+               "delta" returns delta values (-1 to 1).
+
+    Returns:
+        Dict with symbol, expiry, xaxis, and a list of {x, iv} points where
+        iv is annualised implied volatility as a decimal (e.g. 0.73 = 73%).
+    """
+    sym = symbol.upper()
+    exch = exchange.upper()
+
+    expiry_clean = expiry.replace("-", "")
+    if len(expiry_clean) != 8 or not expiry_clean.isdigit():
+        raise ValueError(f"expiry must be YYYY-MM-DD, got '{expiry}'")
+
+    series_id = f"{exch}:{sym};{sym};{expiry_clean}"
+    url = f"https://options-charting.tradingview.com/v1/volatility-chart/{series_id}"
+    data = _scanner_get(url, params={"xaxis": xaxis})
+
+    x_values = data.get("x-axis", {}).get("x", [])
+    plots = data.get("plots", [])
+    y_values = plots[0].get("plot", {}).get("y", []) if plots else []
+
+    points = [{"x": x, "iv": _clean(y)} for x, y in zip(x_values, y_values)]
+
+    expiry_fmt = f"{expiry_clean[:4]}-{expiry_clean[4:6]}-{expiry_clean[6:]}"
+    return {
+        "symbol": f"{exch}:{sym}",
+        "expiry": expiry_fmt,
+        "xaxis": xaxis,
+        "points": points,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 39: Options IV term structure
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_iv_term_structure(
+    symbol: str,
+    exchange: str = "NASDAQ",
+) -> dict:
+    """
+    Get the implied-volatility term structure for a symbol's options.
+
+    Returns IV at both standard calendar tenors (1w, 2w, 1m … 1y) and at the
+    actual available expiry dates.
+
+    Args:
+        symbol: Underlying ticker (e.g. "AAPL").
+        exchange: Exchange of the underlying (e.g. "NASDAQ").
+
+    Returns:
+        Dict with:
+          - standard_ivs: list of {tenor, iv} at fixed tenors (1w/2w/1m/2m/3m/6m/9m/1y).
+          - real_ivs: list of {tenor, iv} at the actual listed expiry dates.
+        All iv values are annualised IV as a decimal (0.73 = 73%).
+    """
+    sym = symbol.upper()
+    exch = exchange.upper()
+    url = f"https://options-charting.tradingview.com/v1/in-time-iv/{exch}:{sym}"
+    data = _scanner_get(url)
+
+    def _parse_spans(items):
+        result = []
+        for item in items:
+            span = item.get("span", {})
+            val  = item.get("value")
+            tenor = f"{span.get('value', '')}{span.get('unit', '')}"
+            result.append({"tenor": tenor, "iv": _clean(val)})
+        return result
+
+    return {
+        "symbol":       f"{exch}:{sym}",
+        "standard_ivs": _parse_spans(data.get("standard-ivs", [])),
+        "real_ivs":     _parse_spans(data.get("real-ivs", [])),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 40: Symbol news
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_symbol_news(
+    symbol: str,
+    exchange: str = "NASDAQ",
+    limit: int = 20,
+    language: str = "en",
+    cursor: Optional[str] = None,
+) -> dict:
+    """
+    Get the latest news articles for a symbol from TradingView.
+
+    Args:
+        symbol: Ticker (e.g. "AAPL").
+        exchange: Exchange (e.g. "NASDAQ").
+        limit: Max articles to return (1–50). Default 20.
+        language: ISO language code (e.g. "en", "fr", "de"). Default "en".
+        cursor: Pagination cursor returned in next_cursor from a previous call.
+
+    Returns:
+        Dict with:
+          - articles: list of {id, title, published_ts, published_date,
+                               provider, story_path, related_symbols}.
+          - next_cursor: pass as cursor in the next call to get older articles.
+    """
+    sym = symbol.upper()
+    exch = exchange.upper()
+    full_sym = f"{exch}:{sym}"
+    limit = max(1, min(limit, 50))
+
+    params = [
+        ("filter", f"lang:{language}"),
+        ("filter", f"symbol:{full_sym}"),
+        ("client", "detail"),
+        ("streaming", "false"),
+        ("user_prostatus", "non_pro"),
+        ("count", str(limit)),
+    ]
+    if cursor:
+        params.append(("cursor", cursor))
+
+    url = "https://news-mediator.tradingview.com/public/news-flow/v2/news"
+    resp = requests.get(url, headers=_SCANNER_HEADERS, params=params, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+
+    articles = []
+    for item in data.get("items", []):
+        ts = item.get("published")
+        pub_date = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M UTC") if ts else None
+        provider = item.get("provider", {})
+        articles.append({
+            "id":              item.get("id"),
+            "title":           item.get("title"),
+            "published_ts":    ts,
+            "published_date":  pub_date,
+            "provider":        provider.get("name"),
+            "story_path":      item.get("storyPath"),
+            "related_symbols": [r.get("symbol") for r in item.get("relatedSymbols", [])],
+        })
+
+    pagination = data.get("pagination", {})
+    return {
+        "symbol":      full_sym,
+        "articles":    articles,
+        "next_cursor": pagination.get("cursor"),
+    }
 
 
 # ---------------------------------------------------------------------------
