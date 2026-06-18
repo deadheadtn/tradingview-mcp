@@ -1,15 +1,20 @@
-# Trading Bot — TradingView MCP Server & Analysis Platform
+# TradingView MCP Server
 
-A stock analysis platform built around a **TradingView MCP server** that exposes 41 market-data tools to Claude and other AI agents, plus a Flask/React portfolio dashboard.
+A [Model Context Protocol](https://modelcontextprotocol.io) server that exposes **41 TradingView market-data tools** to Claude and other AI agents — no rate limiting, no API key required.
 
-## MCP Server
+## Project structure
 
-The core of the project is `backend/mcp_server.py` — a [Model Context Protocol](https://modelcontextprotocol.io) server that gives AI agents direct access to TradingView data without rate limiting.
+```
+tradingview-mcp/
+├── mcp_server.py                      # MCP server — 41 tools
+├── tradingview_historical_fetcher.py  # Historical OHLCV helper
+├── requirements.txt
+└── README.md
+```
 
-### Running the server
+## Quick start
 
 ```bash
-cd backend
 pip install -r requirements.txt
 python mcp_server.py
 ```
@@ -21,12 +26,23 @@ Add it to your Claude Code config (`.mcp.json`):
   "tradingview": {
     "type": "stdio",
     "command": "python",
-    "args": ["backend/mcp_server.py"]
+    "args": ["/path/to/mcp_server.py"]
   }
 }
 ```
 
-### Available tools (41)
+## Environment variables
+
+Create a `.env` file for optional features:
+
+```bash
+# Required only for get_watchlist_tickers
+# Copy from browser cookies while logged into tradingview.com
+TV_SESSION_ID=your_sessionid_cookie
+TV_SESSION_SIGN=your_sessionid_sign_cookie
+```
+
+## Available tools (41)
 
 #### Screening & prices
 | Tool | Description |
@@ -94,7 +110,7 @@ Add it to your Claude Code config (`.mcp.json`):
 #### News
 | Tool | Description |
 |------|-------------|
-| `get_symbol_news` | Latest news articles for a ticker with pagination |
+| `get_symbol_news` | Latest news articles for a ticker with cursor pagination |
 
 #### Backtesting
 | Tool | Description |
@@ -106,99 +122,13 @@ Add it to your Claude Code config (`.mcp.json`):
 #### Portfolio
 | Tool | Description |
 |------|-------------|
-| `get_portfolio_stocks` | Read the local SQLite portfolio database |
-
----
-
-## Environment variables
-
-Copy `backend/.env.example` to `backend/.env` and fill in:
-
-```bash
-# TradingView session — required for get_watchlist_tickers
-# Copy from browser cookies while logged into tradingview.com
-TV_SESSION_ID=your_sessionid_cookie
-TV_SESSION_SIGN=your_sessionid_sign_cookie
-
-# Revolut API (optional — for portfolio sync)
-REVOLUT_CREDENTIALS=...
-REVOLUT_REFRESH_TOKEN=...
-REVOLUT_DEVICE_ID=...
-```
-
----
-
-## Web dashboard (Flask + React)
-
-A portfolio tracking dashboard runs alongside the MCP server.
-
-### Backend
-
-```bash
-cd backend
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-python app.py          # http://localhost:5000
-```
-
-### Frontend
-
-```bash
-cd frontend
-npm install
-npm start              # http://localhost:3000
-```
-
-### REST API
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /api/stocks` | List tracked stocks |
-| `POST /api/stocks` | Add a stock |
-| `GET /api/stocks/:symbol` | Full analysis |
-| `GET /api/stocks/:symbol/chart` | Price history |
-| `GET /api/stocks/:symbol/technicals` | Technical indicators |
-| `POST /api/alerts` | Create price alert |
-| `GET /api/portfolio` | Portfolio summary |
-
----
-
-## Project structure
-
-```
-trading-bot/
-├── backend/
-│   ├── mcp_server.py        # TradingView MCP server (41 tools)
-│   ├── app.py               # Flask REST API
-│   ├── config.py
-│   ├── models.py
-│   ├── requirements.txt
-│   ├── .env                 # Secrets (not committed)
-│   ├── .env.example
-│   ├── services/            # Data fetchers, analyzers, scorers
-│   ├── migrations/
-│   └── tests/
-├── frontend/
-│   ├── src/
-│   │   ├── App.js
-│   │   └── components/
-│   └── package.json
-├── instance/
-│   └── trading_bot.db       # SQLite database
-└── docs/                    # Additional guides
-```
-
----
+| `get_portfolio_stocks` | Read a local SQLite portfolio database |
 
 ## Tech stack
 
-- **MCP server**: Python, [FastMCP](https://github.com/jlowin/fastmcp), TradingView public APIs
-- **Backend**: Python 3.9+, Flask, SQLAlchemy, Pandas, NumPy
-- **Frontend**: React 18, Chart.js, TailwindCSS
-- **Database**: SQLite
-
----
+- Python 3.9+, [FastMCP](https://github.com/jlowin/fastmcp)
+- TradingView public APIs (scanner, options-charting, news-mediator)
+- Pandas, NumPy (backtesting engine)
 
 ## Disclaimer
 
